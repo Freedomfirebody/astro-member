@@ -1,0 +1,6 @@
+{
+  "name": "astro-remember",
+  "description": "A lightweight, file-based Memory MCP server written in Rust with hierarchical memory layers and decay mechanics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
