@@ -45,6 +45,16 @@ cargo build --release
 ```
 The compiled executable will be located at `target/release/astro-member.exe` (on Windows) or `target/release/astro-member` (on macOS/Linux).
 
+### Pre-Download & Initialization (Recommended)
+
+Since the first run triggers a downloading process for the embedding model (approx. 134 MB) which might cause Claude Desktop to time out, it is highly recommended to run the initialization command manually in your terminal first:
+```bash
+# Run the compiled binary with --init or init
+./target/release/astro-member.exe --init
+```
+This will pre-create the local SQLite database and download/cache the required ONNX model files.
+
+
 ### Claude Desktop Integration
 
 Add `astro-member` as an MCP server by modifying your `claude_desktop_config.json` configuration file:

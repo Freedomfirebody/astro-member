@@ -47,6 +47,16 @@ cargo build --release
 ```
 编译后的可执行文件将位于 `target/release/astro-member.exe`（Windows 环境）或 `target/release/astro-member`（macOS/Linux 环境）。
 
+### 预下载模型与手动初始化（推荐）
+
+由于首次运行会触发模型下载流程（约 134 MB），如果在集成到 Claude Desktop 客户端后静默启动，可能会因网络延迟导致客户端连接超时。强烈建议在集成前在终端手动运行初始化命令：
+```bash
+# 运行编译出来的二进制并附带 --init 或 init 参数
+./target/release/astro-member.exe --init
+```
+该命令会自动在本地创建 SQLite 数据库，并拉取缓存所需的 ONNX 嵌入模型文件。下载完成后程序会打印成功信息并自动退出。
+
+
 ### 集成到 Claude 客户端
 
 通过修改您的 `claude_desktop_config.json` 配置文件，将 `astro-member` 注册为 MCP 服务端：

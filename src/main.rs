@@ -59,6 +59,22 @@ fn parse_and_validate_request(line: &str) -> Result<McpRequest, serde_json::Valu
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && (args[1] == "--init" || args[1] == "init") {
+        println!("Initializing Astro-Member storage and pre-downloading embedding models...");
+        let manager = MemoryManager::new(".mcp_memory_storage")?;
+        match manager.embedding_manager.generate_passage_embedding("init") {
+            Ok(_) => {
+                println!("Success: Database and embedding models initialized successfully!");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Error: Failed to initialize embedding models: {:?}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Initialize the root storage directory
     let manager = Arc::new(Mutex::new(MemoryManager::new(".mcp_memory_storage")?));
 
