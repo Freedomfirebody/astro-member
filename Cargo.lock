@@ -52,7 +52,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "astro-member"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -61,6 +61,19 @@ dependencies = [
  "ort",
  "ort-sys",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "astro-member-mcp"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "astro-member",
+ "chrono",
  "serde",
  "serde_json",
  "tokio",

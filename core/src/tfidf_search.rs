@@ -24,7 +24,7 @@ impl LightweightSearch {
             .map(|s| clean_word(s))
             .filter(|s| !s.is_empty())
             .collect();
-        
+
         if query_terms.is_empty() || doc_terms.is_empty() {
             return 0.0;
         }
@@ -37,7 +37,7 @@ impl LightweightSearch {
 
         let doc_len = doc_terms.len() as f64;
 
-        // Simplified BM25 
+        // Simplified BM25
         let k1 = 1.2;
         let b = 0.75;
         let avgdl = 20.0; // Assume avg length
@@ -80,6 +80,7 @@ mod tests {
         let score5 = LightweightSearch::score("rust-mcp", "Using rust-mcp today.");
         assert!(score5 > 0.0);
 
+        // Keep hyphens and underscores in session IDs
         let score6 = LightweightSearch::score("session_id", "Isolated by session_id.");
         assert!(score6 > 0.0);
     }

@@ -1,18 +1,75 @@
-pub mod memory_manager;
-pub mod models;
-pub mod tfidf_search;
-pub mod storage;
-pub mod embedding;
-pub mod search;
-pub mod evolution;
-
 use anyhow::Result;
-use models::{McpRequest, McpResponse, JsonRpcError};
+use astro_member::memory_manager::MemoryManager;
+use astro_member::models;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use memory_manager::MemoryManager;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct McpRequest {
+    pub jsonrpc: String,
+    pub id: Option<serde_json::Value>,
+    pub method: String,
+    pub params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct McpResponse {
+    pub jsonrpc: String,
+    pub id: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcError>,
+}
+
+impl McpResponse {
+    pub fn success(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
+        McpResponse {
+            jsonrpc: "2.0".into(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+    pub fn error(id: Option<serde_json::Value>, error: JsonRpcError) -> Self {
+        McpResponse {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JsonRpcError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl JsonRpcError {
+    pub fn method_not_found() -> Self {
+        JsonRpcError {
+            code: -32601,
+            message: "Method not found".into(),
+        }
+    }
+    pub fn invalid_params(msg: &str) -> Self {
+        JsonRpcError {
+            code: -32602,
+            message: msg.into(),
+        }
+    }
+    pub fn internal(msg: String) -> Self {
+        JsonRpcError {
+            code: -32603,
+            message: msg,
+        }
+    }
+}
 
 fn parse_and_validate_request(line: &str) -> Result<McpRequest, serde_json::Value> {
     let value: serde_json::Value = match serde_json::from_str(line) {
@@ -116,115 +173,200 @@ async fn handle_request(req: McpRequest, manager: Arc<Mutex<MemoryManager>>) -> 
     let mut mgr = manager.lock().await;
 
     let result = match req.method.as_str() {
-        "initialize" => {
-            Ok(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "astro-member",
-                    "version": "0.1.0"
-                }
-            }))
-        }
-        "notifications/initialized" | "initialized" => {
-            Ok(json!({}))
-        }
-        "mcp.server.info" => {
-            Ok(json!({
+        "initialize" => Ok(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {}
+            },
+            "serverInfo": {
                 "name": "astro-member",
-                "version": "0.1.0",
-                "capabilities": {
-                    "tools": true
-                }
-            }))
-        }
-        "tools/list" | "mcp.tools.list" => {
-            Ok(json!({
-                "tools": [
-                    {
-                        "name": "store_memory",
-                        "description": "Store a memory conceptually into different hierarchical layers.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "layer": { "type": "string", "enum": ["Rule", "Persona", "Experience", "Session"] },
-                                "session_id": { "type": "string", "description": "Required if layer is Session" },
-                                "content": { "type": "string" },
-                                "context_tags": { "type": "array", "items": { "type": "string" } }
+                "version": "0.2.0"
+            }
+        })),
+        "notifications/initialized" | "initialized" => Ok(json!({})),
+        "mcp.server.info" => Ok(json!({
+            "name": "astro-member",
+            "version": "0.2.0",
+            "capabilities": {
+                "tools": true
+            }
+        })),
+        "tools/list" | "mcp.tools.list" => Ok(json!({
+            "tools": [
+                {
+                    "name": "store_memory",
+                    "description": "Store a memory conceptually into different hierarchical layers.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "layer": { "type": "string", "enum": ["Rule", "Persona", "Experience", "Session"] },
+                            "session_id": { "type": "string", "description": "Required if layer is Session" },
+                            "content": { "type": "string" },
+                            "context_tags": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["layer", "content"]
+                    }
+                },
+                {
+                    "name": "retrieve_memory",
+                    "description": "Retrieve memories across layers using cohesive weighted search.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" },
+                            "session_id": { "type": "string" }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "evaluate_experience",
+                    "description": "Evaluate an experience to determine if it achieved its goal (modifies its weight).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": { "type": "string" },
+                            "success": { "type": "boolean" }
+                        },
+                        "required": ["memory_id", "success"]
+                    }
+                },
+                {
+                    "name": "get_memory_by_id",
+                    "description": "Retrieve a specific memory by its unique ID.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "The unique ID of the memory to retrieve." },
+                            "session_id": { "type": "string", "description": "The session ID, required if the target memory is in the Session layer." }
+                        },
+                        "required": ["id"]
+                    }
+                },
+                {
+                    "name": "create_association",
+                    "description": "Create a semantic association/relation between two existing memories in the graph database.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "source_id": { "type": "string", "description": "The ID of the source memory." },
+                            "target_id": { "type": "string", "description": "The ID of the target memory." },
+                            "relation_type": { "type": "string", "description": "The type of association (e.g., related_to, depends_on)." }
+                        },
+                        "required": ["source_id", "target_id", "relation_type"]
+                    }
+                },
+                {
+                    "name": "get_associations",
+                    "description": "Retrieve semantic associations/relations originating from or targeting a memory.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "source_id": { "type": "string", "description": "The ID of the source memory to query relations for." },
+                            "direction": {
+                                "type": "string",
+                                "enum": ["outgoing", "incoming", "both"],
+                                "description": "The direction of associations to retrieve relative to the source memory. Default is outgoing."
+                            }
+                        },
+                        "required": ["source_id"]
+                    }
+                },
+                {
+                    "name": "get_conflict_candidates",
+                    "description": "Find active memories that are semantically similar to the proposed content.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "The proposed new memory content." },
+                            "session_id": { "type": "string", "description": "Scope search to this session (optional)." },
+                            "threshold": { "type": "number", "description": "Minimum similarity score to qualify as a conflict. Defaults to 0.70." },
+                            "limit": { "type": "integer", "description": "Max candidates to return. Defaults to 5." }
+                        },
+                        "required": ["content"]
+                    }
+                },
+                {
+                    "name": "resolve_conflict",
+                    "description": "Atomically execute a set of deprecations, deletions, memory insertions, and association updates to resolve conflicts.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "deprecate_ids": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "IDs of existing memories to soft-deprecate."
                             },
-                            "required": ["layer", "content"]
-                        }
-                    },
-                    {
-                        "name": "retrieve_memory",
-                        "description": "Retrieve memories across layers using cohesive weighted search.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "query": { "type": "string" },
-                                "session_id": { "type": "string" }
+                            "delete_ids": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "IDs of existing memories to permanently delete."
                             },
-                            "required": ["query"]
-                        }
-                    },
-                    {
-                        "name": "evaluate_experience",
-                        "description": "Evaluate an experience to determine if it achieved its goal (modifies its weight).",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "memory_id": { "type": "string" },
-                                "success": { "type": "boolean" }
+                            "new_memories": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string", "description": "Optional custom UUID." },
+                                        "layer": { "type": "string", "enum": ["Rule", "Persona", "Experience", "Session"] },
+                                        "session_id": { "type": "string", "description": "Required if layer is Session." },
+                                        "content": { "type": "string" },
+                                        "tags": { "type": "array", "items": { "type": "string" } }
+                                    },
+                                    "required": ["layer", "content"]
+                                },
+                                "description": "New memory entries to insert."
                             },
-                            "required": ["memory_id", "success"]
-                        }
-                    },
-                    {
-                        "name": "get_memory_by_id",
-                        "description": "Retrieve a specific memory by its unique ID.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "id": { "type": "string", "description": "The unique ID of the memory to retrieve." },
-                                "session_id": { "type": "string", "description": "The session ID, required if the target memory is in the Session layer." }
-                            },
-                            "required": ["id"]
-                        }
-                    },
-                    {
-                        "name": "create_association",
-                        "description": "Create a semantic association/relation between two existing memories in the graph database.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "source_id": { "type": "string", "description": "The ID of the source memory." },
-                                "target_id": { "type": "string", "description": "The ID of the target memory." },
-                                "relation_type": { "type": "string", "description": "The type of association (e.g., related_to, depends_on)." }
-                            },
-                            "required": ["source_id", "target_id", "relation_type"]
-                        }
-                    },
-                    {
-                        "name": "get_associations",
-                        "description": "Retrieve semantic associations/relations originating from or targeting a memory.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "source_id": { "type": "string", "description": "The ID of the source memory to query relations for." },
-                                "direction": {
-                                    "type": "string",
-                                    "enum": ["outgoing", "incoming", "both"],
-                                    "description": "The direction of associations to retrieve relative to the source memory. Default is outgoing."
-                                }
-                            },
-                            "required": ["source_id"]
+                            "new_associations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "source_id": { "type": "string" },
+                                        "target_id": { "type": "string" },
+                                        "relation_type": { "type": "string" }
+                                    },
+                                    "required": ["source_id", "target_id", "relation_type"]
+                                },
+                                "description": "Graph associations to write."
+                            }
                         }
                     }
-                ]
-            }))
-        }
+                },
+                {
+                    "name": "get_session_memories",
+                    "description": "Retrieve all active memories associated with a given session in chronological order.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string", "description": "The target session ID." },
+                            "limit": { "type": "integer", "description": "Max memories to retrieve (optional)." }
+                        },
+                        "required": ["session_id"]
+                    }
+                },
+                {
+                    "name": "purge_session_memories",
+                    "description": "Bulk soft-deprecate or hard-delete memories in a session, preserving specified items.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string", "description": "The session ID to purge." },
+                            "preserve_ids": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "IDs to protect from being purged."
+                            },
+                            "permanent": {
+                                "type": "boolean",
+                                "description": "If true, permanently delete. If false, soft-deprecate. Defaults to false."
+                            }
+                        },
+                        "required": ["session_id"]
+                    }
+                }
+            ]
+        })),
         "tools/call" | "mcp.tools.call" => {
             if let Some(params) = req.params {
                 let name = params["name"].as_str().unwrap_or("");
@@ -243,7 +385,11 @@ async fn handle_request(req: McpRequest, manager: Arc<Mutex<MemoryManager>>) -> 
                         let content = args["content"].as_str().unwrap_or("").to_string();
                         let tags: Vec<String> = args["context_tags"]
                             .as_array()
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default();
 
                         match mgr.store(layer, session_id, content, tags) {
@@ -337,7 +483,7 @@ async fn handle_request(req: McpRequest, manager: Arc<Mutex<MemoryManager>>) -> 
                     "evaluate_experience" => {
                         let memory_id = args["memory_id"].as_str().unwrap_or("");
                         let success = args["success"].as_bool().unwrap_or(false);
-                        
+
                         match mgr.evaluate_experience(memory_id, success) {
                             Ok(_) => Ok(json!({
                                 "content": [
@@ -405,6 +551,186 @@ async fn handle_request(req: McpRequest, manager: Arc<Mutex<MemoryManager>>) -> 
                                     }
                                 ]
                             })),
+                        }
+                    }
+                    "get_conflict_candidates" => {
+                        let content = args["content"].as_str().unwrap_or("");
+                        let session_id = args["session_id"].as_str().map(String::from);
+                        let threshold = args["threshold"].as_f64();
+                        let limit = args["limit"].as_u64().map(|l| l as usize);
+
+                        if content.trim().is_empty() {
+                            Ok(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Parameter 'content' is required and cannot be empty."
+                                    }
+                                ]
+                            }))
+                        } else {
+                            match mgr.get_conflict_candidates(content, session_id, threshold, limit)
+                            {
+                                Ok(candidates) => Ok(json!({
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": serde_json::to_string(&json!({ "candidates": candidates })).unwrap()
+                                        }
+                                    ]
+                                })),
+                                Err(e) => Ok(json!({
+                                    "isError": true,
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": e.to_string()
+                                        }
+                                    ]
+                                })),
+                            }
+                        }
+                    }
+                    "resolve_conflict" => {
+                        let deprecate_ids: Vec<String> = args["deprecate_ids"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let delete_ids: Vec<String> = args["delete_ids"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let new_memories: Vec<models::MemoryEntryInput> = args["new_memories"]
+                            .as_array()
+                            .map(|a| {
+                                serde_json::from_value(serde_json::Value::Array(a.clone()))
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+
+                        let new_associations: Vec<models::AssociationInput> = args
+                            ["new_associations"]
+                            .as_array()
+                            .map(|a| {
+                                serde_json::from_value(serde_json::Value::Array(a.clone()))
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+
+                        match mgr.resolve_conflict(
+                            &deprecate_ids,
+                            &delete_ids,
+                            &new_memories,
+                            &new_associations,
+                        ) {
+                            Ok(inserted_ids) => Ok(json!({
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": serde_json::to_string(&json!({ "status": "success", "inserted_ids": inserted_ids })).unwrap()
+                                    }
+                                ]
+                            })),
+                            Err(e) => Ok(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": e.to_string()
+                                    }
+                                ]
+                            })),
+                        }
+                    }
+                    "get_session_memories" => {
+                        let session_id = args["session_id"].as_str().unwrap_or("");
+                        let limit = args["limit"].as_u64().map(|l| l as usize);
+
+                        if session_id.trim().is_empty() {
+                            Ok(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Parameter 'session_id' is required and cannot be empty."
+                                    }
+                                ]
+                            }))
+                        } else {
+                            match mgr.get_session_memories(session_id, limit) {
+                                Ok(memories) => Ok(json!({
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": serde_json::to_string(&json!({ "memories": memories })).unwrap()
+                                        }
+                                    ]
+                                })),
+                                Err(e) => Ok(json!({
+                                    "isError": true,
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": e.to_string()
+                                        }
+                                    ]
+                                })),
+                            }
+                        }
+                    }
+                    "purge_session_memories" => {
+                        let session_id = args["session_id"].as_str().unwrap_or("");
+                        let preserve_ids: Vec<String> = args["preserve_ids"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let permanent = args["permanent"].as_bool().unwrap_or(false);
+
+                        if session_id.trim().is_empty() {
+                            Ok(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Parameter 'session_id' is required and cannot be empty."
+                                    }
+                                ]
+                            }))
+                        } else {
+                            match mgr.purge_session_memories(session_id, &preserve_ids, permanent) {
+                                Ok(count) => Ok(json!({
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": serde_json::to_string(&json!({ "status": "success", "purged_count": count })).unwrap()
+                                        }
+                                    ]
+                                })),
+                                Err(e) => Ok(json!({
+                                    "isError": true,
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": e.to_string()
+                                        }
+                                    ]
+                                })),
+                            }
                         }
                     }
                     _ => Ok(json!({
@@ -481,7 +807,7 @@ mod tests {
         assert!(resp_list.error.is_none());
         let result = resp_list.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 10);
         assert!(tools.iter().any(|t| t["name"] == "store_memory"));
         assert!(tools.iter().any(|t| t["name"] == "create_association"));
         assert!(tools.iter().any(|t| t["name"] == "get_memory_by_id"));
@@ -547,7 +873,10 @@ mod tests {
             })),
         };
         let resp_store_exp = handle_request(req_store_exp, manager.clone()).await;
-        let content_text = resp_store_exp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        let content_text = resp_store_exp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let val: serde_json::Value = serde_json::from_str(&content_text).unwrap();
         let exp_id = val["memory_id"].as_str().unwrap().to_string();
 
@@ -565,13 +894,20 @@ mod tests {
         };
         let resp_eval = handle_request(req_eval, manager.clone()).await;
         assert!(resp_eval.error.is_none());
-        let content_text = resp_eval.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        let content_text = resp_eval.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let val: serde_json::Value = serde_json::from_str(&content_text).unwrap();
         assert_eq!(val["status"], "evaluated");
 
         // Verify the score updated
         let manager_lock = manager.lock().await;
-        let exp_entry = manager_lock.storage.get_memory_by_id(&exp_id).unwrap().unwrap();
+        let exp_entry = manager_lock
+            .storage
+            .get_memory_by_id(&exp_id)
+            .unwrap()
+            .unwrap();
         assert!((exp_entry.evaluation_score - 1.1).abs() < 1e-9);
         drop(manager_lock);
 
@@ -655,8 +991,11 @@ mod tests {
         let resp_get_assoc_in = handle_request(req_get_assoc_in, manager.clone()).await;
         assert!(resp_get_assoc_in.error.is_none());
         let val_in: serde_json::Value = serde_json::from_str(
-            resp_get_assoc_in.result.unwrap()["content"][0]["text"].as_str().unwrap()
-        ).unwrap();
+            resp_get_assoc_in.result.unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(val_in["associations"].as_array().unwrap().len(), 1);
         assert_eq!(val_in["associations"][0]["source_id"], memory_id);
         assert_eq!(val_in["associations"][0]["target_id"], exp_id);
@@ -693,7 +1032,10 @@ mod tests {
         assert!(resp_unknown.error.is_none());
         let result_unknown = resp_unknown.result.unwrap();
         assert_eq!(result_unknown["isError"], true);
-        assert!(result_unknown["content"][0]["text"].as_str().unwrap().contains("Tool 'non_existent_tool' not found"));
+        assert!(result_unknown["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Tool 'non_existent_tool' not found"));
 
         // 3. Invalid layer string defaults to Session layer, which fails if session_id is missing
         let req_invalid_layer = McpRequest {
@@ -712,7 +1054,10 @@ mod tests {
         assert!(resp_invalid_layer.error.is_none());
         let result_invalid = resp_invalid_layer.result.unwrap();
         assert_eq!(result_invalid["isError"], true);
-        assert!(result_invalid["content"][0]["text"].as_str().unwrap().contains("Session ID is required"));
+        assert!(result_invalid["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Session ID is required"));
 
         // 4. Invalid layer string with session_id succeeds as Session layer
         let req_invalid_layer_with_id = McpRequest {
@@ -728,7 +1073,8 @@ mod tests {
                 }
             })),
         };
-        let resp_invalid_layer_with_id = handle_request(req_invalid_layer_with_id, manager.clone()).await;
+        let resp_invalid_layer_with_id =
+            handle_request(req_invalid_layer_with_id, manager.clone()).await;
         assert!(resp_invalid_layer_with_id.error.is_none());
         let result_val = resp_invalid_layer_with_id.result.unwrap();
         let content_text = result_val["content"][0]["text"].as_str().unwrap();
@@ -759,7 +1105,11 @@ mod tests {
         // Verify it was stored as Rule layer
         {
             let manager_lock = manager.lock().await;
-            let entry = manager_lock.storage.get_memory_by_id(&principle_id).unwrap().unwrap();
+            let entry = manager_lock
+                .storage
+                .get_memory_by_id(&principle_id)
+                .unwrap()
+                .unwrap();
             assert_eq!(entry.layer, models::MemoryLayer::Rule);
         }
 
@@ -780,7 +1130,10 @@ mod tests {
         assert!(resp_invalid_eval.error.is_none()); // The MCP wrapper catches error and returns it in JSON body
         let result_eval = resp_invalid_eval.result.unwrap();
         assert_eq!(result_eval["isError"], true);
-        assert!(result_eval["content"][0]["text"].as_str().unwrap().contains("Memory is not in the Experience layer"));
+        assert!(result_eval["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Memory is not in the Experience layer"));
 
         Ok(())
     }
@@ -871,15 +1224,23 @@ mod tests {
             })),
         };
         let resp_unknown = handle_request(req_unknown_tool, manager.clone()).await;
-        assert!(resp_unknown.error.is_none(), "Unrecognized tool calls must not yield JSON-RPC error");
-        let result_unknown = resp_unknown.result.unwrap();
-        assert_eq!(result_unknown["isError"], true, "Unrecognized tool must yield isError: true");
         assert!(
-            result_unknown["content"][0]["text"].as_str().unwrap().contains("Tool 'unrecognized_adversarial_tool' not found"),
+            resp_unknown.error.is_none(),
+            "Unrecognized tool calls must not yield JSON-RPC error"
+        );
+        let result_unknown = resp_unknown.result.unwrap();
+        assert_eq!(
+            result_unknown["isError"], true,
+            "Unrecognized tool must yield isError: true"
+        );
+        assert!(
+            result_unknown["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Tool 'unrecognized_adversarial_tool' not found"),
             "Should return 'not found' text content"
         );
 
         Ok(())
     }
 }
-
