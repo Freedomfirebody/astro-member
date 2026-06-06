@@ -17,6 +17,9 @@ impl EmbeddingManager {
     }
 
     fn get_model(&self) -> Result<&TextEmbedding> {
+        if std::env::var("ASTRO_MEMBER_SKIP_EMBEDDING").is_ok() {
+            return Err(anyhow!("Embedding model loading is disabled via ASTRO_MEMBER_SKIP_EMBEDDING env var"));
+        }
         self.model.get_or_try_init(|| {
             let mut options = InitOptions::default();
             if let Some(ref cache) = self.cache_dir {

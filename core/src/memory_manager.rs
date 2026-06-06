@@ -268,7 +268,48 @@ impl MemoryManager {
         };
 
         if query_embedding.is_empty() {
-            return Ok(Vec::new());
+            let memories = self.storage.get_relevant_memories(session_id.as_deref())?;
+            let mut candidates = Vec::new();
+
+            let words1: std::collections::HashSet<String> = content
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+
+            if !words1.is_empty() {
+                for mem in memories {
+                    let words2: std::collections::HashSet<String> = mem.content
+                        .to_lowercase()
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+                    if words2.is_empty() {
+                        continue;
+                    }
+                    let intersection: std::collections::HashSet<_> = words1.intersection(&words2).collect();
+                    let sim = (intersection.len() as f64) / (std::cmp::min(words1.len(), words2.len()) as f64);
+                    let sim = if sim > 0.5 { sim + 0.1 } else { sim };
+                    let sim = sim.min(1.0);
+
+                    if sim >= thresh {
+                        candidates.push(crate::models::ConflictCandidate {
+                            memory: mem,
+                            similarity: sim,
+                        });
+                    }
+                }
+            }
+
+            candidates.sort_by(|a, b| {
+                b.similarity
+                    .partial_cmp(&a.similarity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidates.truncate(lim);
+            return Ok(candidates);
         }
 
         let memories = self.storage.get_relevant_memories(session_id.as_deref())?;

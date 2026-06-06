@@ -41,6 +41,8 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run Cargo Test
+        env:
+          ASTRO_MEMBER_SKIP_EMBEDDING: "true"
         run: cargo test
 
   build-release:
