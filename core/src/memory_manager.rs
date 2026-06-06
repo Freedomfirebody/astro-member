@@ -1,10 +1,10 @@
-use crate::models::{MemoryEntry, MemoryLayer, SearchResult, Association};
+use crate::models::{Association, MemoryEntry, MemoryLayer, MemoryStatus, SearchResult};
 use crate::storage::SqliteStorage;
 use crate::tfidf_search::LightweightSearch;
-use anyhow::{Result, Context};
+use anyhow::Result;
+use chrono::Utc;
 use std::path::Path;
 use uuid::Uuid;
-use chrono::Utc;
 
 pub struct MemoryManager {
     pub storage: SqliteStorage,
@@ -46,17 +46,35 @@ impl MemoryManager {
 
         let storage = SqliteStorage::new(db_path)?;
         let embedding_manager = crate::embedding::EmbeddingManager::new(cache_dir);
-        Ok(MemoryManager { storage, embedding_manager })
+        Ok(MemoryManager {
+            storage,
+            embedding_manager,
+        })
     }
 
-    pub fn store(&mut self, layer: MemoryLayer, session_id: Option<String>, content: String, tags: Vec<String>) -> Result<String> {
+    pub fn store(
+        &mut self,
+        layer: MemoryLayer,
+        session_id: Option<String>,
+        content: String,
+        tags: Vec<String>,
+    ) -> Result<String> {
         if layer == MemoryLayer::Session {
-            if session_id.is_none() || session_id.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
-                return Err(anyhow::anyhow!("Session ID is required for Session layer memory"));
+            if session_id.is_none()
+                || session_id
+                    .as_ref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+            {
+                return Err(anyhow::anyhow!(
+                    "Session ID is required for Session layer memory"
+                ));
             }
         } else {
             if session_id.is_some() {
-                return Err(anyhow::anyhow!("Session ID must not be provided for non-Session layer memory"));
+                return Err(anyhow::anyhow!(
+                    "Session ID must not be provided for non-Session layer memory"
+                ));
             }
         }
         let id = Uuid::new_v4().to_string();
@@ -78,15 +96,20 @@ impl MemoryManager {
             access_count: 0,
             evaluation_score: 1.0,
             embedding,
+            status: MemoryStatus::Active,
         };
 
         self.storage.insert_memory(&memory)?;
         Ok(id)
     }
 
-    pub fn retrieve(&mut self, query: &str, request_session_id: Option<String>) -> Result<Vec<SearchResult>> {
+    pub fn retrieve(
+        &mut self,
+        query: &str,
+        request_session_id: Option<String>,
+    ) -> Result<Vec<SearchResult>> {
         let now = Utc::now();
-        
+
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -101,7 +124,9 @@ impl MemoryManager {
         let mut candidates = Vec::new();
 
         // Dynamically query only relevant memories from SQLite
-        let memories = self.storage.get_relevant_memories(request_session_id.as_deref())?;
+        let memories = self
+            .storage
+            .get_relevant_memories(request_session_id.as_deref())?;
 
         for mem in memories {
             // Memory Isolation: Rule 1 (If Session Layer, strictly isolate by SessionId)
@@ -117,7 +142,8 @@ impl MemoryManager {
 
             // Calculate semantic relevance
             let semantic_score = if !query_embedding.is_empty() && !mem.embedding.is_empty() {
-                let sim = crate::search::cosine_similarity(&query_embedding, &mem.embedding).unwrap_or(0.0);
+                let sim = crate::search::cosine_similarity(&query_embedding, &mem.embedding)
+                    .unwrap_or(0.0);
                 if sim < 0.65 {
                     0.0
                 } else {
@@ -130,7 +156,6 @@ impl MemoryManager {
             // Compute the combined relevance score using hybrid search
             let combined_relevance = normalized_text_score.max(semantic_score as f64);
 
-
             // Rules bypass the 0.15 relevance filter to remain permanently active
             if mem.layer != MemoryLayer::Rule && combined_relevance < 0.15 {
                 continue;
@@ -139,34 +164,48 @@ impl MemoryManager {
             // Calculate days_old as a fractional f64 value (using seconds old divided by 86400.0) based on last_accessed
             let seconds_old = ((now - mem.last_accessed).num_seconds() as f64).max(0.0);
             let days_old = seconds_old / 86400.0;
-            
+
             // Memory Decay Mechanism
             let decay = (-mem.layer.decay_rate() * days_old).exp();
-            
+
             // Make frequency boost multiplicative
             let freq_boost = 1.0 + (mem.access_count as f64 + 1.0).ln() * 0.1;
 
             // Layer weight + evaluation
             let layer_weight = mem.layer.base_weight();
-            let final_score = combined_relevance * layer_weight * decay * mem.evaluation_score * freq_boost;
+            let final_score =
+                combined_relevance * layer_weight * decay * mem.evaluation_score * freq_boost;
 
             candidates.push(SearchResult {
                 memory: mem,
                 final_score,
+                size: 0,
+                created_at: String::new(),
+                cumulative_size: 0,
             });
         }
 
         // Sort by final unified activation score
-        candidates.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         // Return top 5 clustered context
         candidates.truncate(5);
 
-        // Update last accessed timestamp and access count ONLY for the final top 5 returned memories
+        // Calculate metadata post-truncation
         let mut update_refs = Vec::new();
+        let mut running_size = 0;
         for result in candidates.iter_mut() {
             result.memory.access_count = result.memory.access_count.saturating_add(1);
             result.memory.last_accessed = now;
             update_refs.push(&result.memory);
+
+            result.size = result.memory.content.chars().count();
+            running_size += result.size;
+            result.cumulative_size = running_size;
+            result.created_at = result.memory.created_at.to_rfc3339();
         }
         self.storage.update_memories_batch(&update_refs)?;
 
@@ -174,20 +213,27 @@ impl MemoryManager {
     }
 
     pub fn evaluate_experience(&mut self, memory_id: &str, success: bool) -> Result<()> {
-        let mut mem = self.storage.get_memory_by_id(memory_id)?
+        let mut mem = self
+            .storage
+            .get_memory_by_id(memory_id)?
             .ok_or_else(|| anyhow::anyhow!("Memory not found: {}", memory_id))?;
 
         if mem.layer != MemoryLayer::Experience {
             return Err(anyhow::anyhow!("Memory is not in the Experience layer"));
         }
 
-        let engine = crate::evolution::EvolutionEngine::new(crate::evolution::EvolutionConfig::default());
+        let engine =
+            crate::evolution::EvolutionEngine::new(crate::evolution::EvolutionConfig::default());
         mem.evaluation_score = engine.evaluate(mem.evaluation_score, success, &mem.layer);
         self.storage.update_memory(&mem)?;
         Ok(())
     }
 
-    pub fn get_memory_by_id(&self, id: &str, session_id: Option<&str>) -> Result<Option<MemoryEntry>> {
+    pub fn get_memory_by_id(
+        &self,
+        id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<MemoryEntry>> {
         if let Some(mem) = self.storage.get_memory_by_id(id)? {
             if mem.layer == MemoryLayer::Session {
                 if let Some(sid) = session_id {
@@ -203,23 +249,244 @@ impl MemoryManager {
         }
     }
 
-    pub fn create_association(&mut self, source_id: &str, target_id: &str, relation_type: &str) -> Result<()> {
+    pub fn get_conflict_candidates(
+        &mut self,
+        content: &str,
+        session_id: Option<String>,
+        threshold: Option<f64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::models::ConflictCandidate>> {
+        let thresh = threshold.unwrap_or(0.70);
+        let lim = limit.unwrap_or(5);
+
+        let query_embedding = match self.embedding_manager.generate_query_embedding(content) {
+            Ok(emb) => emb,
+            Err(e) => {
+                eprintln!("Warning: Failed to generate query embedding: {:?}", e);
+                Vec::new()
+            }
+        };
+
+        if query_embedding.is_empty() {
+            let memories = self.storage.get_relevant_memories(session_id.as_deref())?;
+            let mut candidates = Vec::new();
+
+            let words1: std::collections::HashSet<String> = content
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+
+            if !words1.is_empty() {
+                for mem in memories {
+                    let words2: std::collections::HashSet<String> = mem.content
+                        .to_lowercase()
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+                    if words2.is_empty() {
+                        continue;
+                    }
+                    let intersection: std::collections::HashSet<_> = words1.intersection(&words2).collect();
+                    let sim = (intersection.len() as f64) / (std::cmp::min(words1.len(), words2.len()) as f64);
+                    let sim = if sim > 0.5 { sim + 0.1 } else { sim };
+                    let sim = sim.min(1.0);
+
+                    if sim >= thresh {
+                        candidates.push(crate::models::ConflictCandidate {
+                            memory: mem,
+                            similarity: sim,
+                        });
+                    }
+                }
+            }
+
+            candidates.sort_by(|a, b| {
+                b.similarity
+                    .partial_cmp(&a.similarity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidates.truncate(lim);
+            return Ok(candidates);
+        }
+
+        let memories = self.storage.get_relevant_memories(session_id.as_deref())?;
+        let mut candidates = Vec::new();
+
+        for mem in memories {
+            if !mem.embedding.is_empty() {
+                let sim = crate::search::cosine_similarity(&query_embedding, &mem.embedding)
+                    .unwrap_or(0.0) as f64;
+                if sim >= thresh {
+                    candidates.push(crate::models::ConflictCandidate {
+                        memory: mem,
+                        similarity: sim,
+                    });
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(lim);
+
+        Ok(candidates)
+    }
+
+    pub fn resolve_conflict(
+        &mut self,
+        deprecate_ids: &[String],
+        delete_ids: &[String],
+        new_memories: &[crate::models::MemoryEntryInput],
+        new_associations: &[crate::models::AssociationInput],
+    ) -> Result<Vec<String>> {
+        let mut inserted_ids = Vec::new();
+        let mut entries = Vec::new();
+
+        for input in new_memories {
+            if input.layer == MemoryLayer::Session {
+                if input.session_id.is_none()
+                    || input
+                        .session_id
+                        .as_ref()
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true)
+                {
+                    return Err(anyhow::anyhow!(
+                        "Session ID is required for Session layer memory"
+                    ));
+                }
+            } else {
+                if input.session_id.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "Session ID must not be provided for non-Session layer memory"
+                    ));
+                }
+            }
+
+            let id = input
+                .id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            inserted_ids.push(id.clone());
+
+            let embedding = match self
+                .embedding_manager
+                .generate_passage_embedding(&input.content)
+            {
+                Ok(emb) => emb,
+                Err(e) => {
+                    eprintln!("Warning: Failed to generate passage embedding: {:?}", e);
+                    Vec::new()
+                }
+            };
+
+            let entry = MemoryEntry {
+                id,
+                layer: input.layer.clone(),
+                session_id: input.session_id.clone(),
+                content: input.content.clone(),
+                tags: input.tags.clone(),
+                created_at: Utc::now(),
+                last_accessed: Utc::now(),
+                access_count: 0,
+                evaluation_score: 1.0,
+                embedding,
+                status: MemoryStatus::Active,
+            };
+            entries.push(entry);
+        }
+
+        let mut assocs = Vec::new();
+        for assoc_input in new_associations {
+            let rel_trimmed = assoc_input.relation_type.trim();
+            if rel_trimmed.is_empty() {
+                return Err(anyhow::anyhow!("Relation type cannot be empty"));
+            }
+            if assoc_input.source_id == assoc_input.target_id {
+                return Err(anyhow::anyhow!(
+                    "Self-referential associations are not allowed"
+                ));
+            }
+
+            assocs.push(Association {
+                source_id: assoc_input.source_id.clone(),
+                target_id: assoc_input.target_id.clone(),
+                relation_type: rel_trimmed.to_string(),
+                created_at: Utc::now(),
+            });
+        }
+
+        self.storage.execute_transactional_resolution(
+            deprecate_ids,
+            delete_ids,
+            &entries,
+            &assocs,
+        )?;
+
+        Ok(inserted_ids)
+    }
+
+    pub fn get_session_memories(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if session_id.trim().is_empty() {
+            return Err(anyhow::anyhow!("Session ID cannot be empty"));
+        }
+        self.storage.get_session_memories(session_id, limit)
+    }
+
+    pub fn purge_session_memories(
+        &self,
+        session_id: &str,
+        preserve_ids: &[String],
+        permanent: bool,
+    ) -> Result<usize> {
+        if session_id.trim().is_empty() {
+            return Err(anyhow::anyhow!("Session ID cannot be empty"));
+        }
+        self.storage
+            .purge_session_memories(session_id, preserve_ids, permanent)
+    }
+
+    pub fn create_association(
+        &mut self,
+        source_id: &str,
+        target_id: &str,
+        relation_type: &str,
+    ) -> Result<()> {
         let relation_trimmed = relation_type.trim();
         if relation_trimmed.is_empty() {
-            return Err(anyhow::anyhow!("Relation type cannot be empty or whitespace-only"));
+            return Err(anyhow::anyhow!(
+                "Relation type cannot be empty or whitespace-only"
+            ));
         }
         if source_id == target_id {
             return Err(anyhow::anyhow!("Self-referential associations are not allowed (source_id and target_id are identical: {})", source_id));
         }
 
         // Validate existence of source and target nodes
-        let source = self.storage.get_memory_by_id(source_id)?
+        let source = self
+            .storage
+            .get_memory_by_id(source_id)?
             .ok_or_else(|| anyhow::anyhow!("Source memory with ID '{}' not found", source_id))?;
-        let target = self.storage.get_memory_by_id(target_id)?
+        let target = self
+            .storage
+            .get_memory_by_id(target_id)?
             .ok_or_else(|| anyhow::anyhow!("Target memory with ID '{}' not found", target_id))?;
 
         if source.layer == MemoryLayer::Session && target.layer == MemoryLayer::Session {
-            if source.session_id.is_none() || target.session_id.is_none() || source.session_id != target.session_id {
+            if source.session_id.is_none()
+                || target.session_id.is_none()
+                || source.session_id != target.session_id
+            {
                 return Err(anyhow::anyhow!("Cross-session association is prohibited"));
             }
         }
@@ -233,14 +500,24 @@ impl MemoryManager {
         self.storage.create_association(&assoc)
     }
 
-    pub fn get_associations(&mut self, source_id: &str, direction: Option<&str>) -> Result<Vec<Association>> {
+    pub fn get_associations(
+        &mut self,
+        source_id: &str,
+        direction: Option<&str>,
+    ) -> Result<Vec<Association>> {
         let dir = direction.unwrap_or("outgoing");
         if dir != "outgoing" && dir != "incoming" && dir != "both" {
-            return Err(anyhow::anyhow!("Invalid direction: '{}'. Allowed values are 'outgoing', 'incoming', or 'both'", dir));
+            return Err(anyhow::anyhow!(
+                "Invalid direction: '{}'. Allowed values are 'outgoing', 'incoming', or 'both'",
+                dir
+            ));
         }
 
         if self.storage.get_memory_by_id(source_id)?.is_none() {
-            return Err(anyhow::anyhow!("Source memory with ID '{}' not found", source_id));
+            return Err(anyhow::anyhow!(
+                "Source memory with ID '{}' not found",
+                source_id
+            ));
         }
         self.storage.get_associations(source_id, dir)
     }
@@ -251,7 +528,6 @@ mod tests {
     use super::*;
     use crate::models::MemoryLayer;
     use std::sync::Arc;
-
 
     #[test]
     fn test_memory_manager_store_and_retrieve() -> Result<()> {
@@ -278,12 +554,14 @@ mod tests {
         assert_eq!(results[0].memory.id, id1);
 
         // Retrieve session memory with correct session ID
-        let results_session = manager.retrieve("prefers Python", Some("session-123".to_string()))?;
+        let results_session =
+            manager.retrieve("prefers Python", Some("session-123".to_string()))?;
         assert_eq!(results_session.len(), 1);
         assert_eq!(results_session[0].memory.id, id2);
 
         // Retrieve session memory with incorrect session ID (should be isolated)
-        let results_wrong_session = manager.retrieve("prefers Python", Some("session-456".to_string()))?;
+        let results_wrong_session =
+            manager.retrieve("prefers Python", Some("session-456".to_string()))?;
         assert!(results_wrong_session.is_empty());
 
         // Retrieve session memory with no session ID (should be isolated)
@@ -302,15 +580,13 @@ mod tests {
         assert!(results.is_empty(), "Empty query should return no results");
 
         let results_spaces = manager.retrieve("   ", None)?;
-        assert!(results_spaces.is_empty(), "Whitespace-only query should return no results");
+        assert!(
+            results_spaces.is_empty(),
+            "Whitespace-only query should return no results"
+        );
 
         // 2. Empty content store
-        let id = manager.store(
-            MemoryLayer::Experience,
-            None,
-            "".to_string(),
-            vec![],
-        )?;
+        let _id = manager.store(MemoryLayer::Experience, None, "".to_string(), vec![])?;
         // Storing empty content is allowed by the database/code.
         // But searching for it should return nothing since BM25 score will be 0.
         let results = manager.retrieve("", None)?;
@@ -331,7 +607,10 @@ mod tests {
             "Some session memory".to_string(),
             vec![],
         );
-        assert!(res.is_err(), "Session layer memory must require a session ID");
+        assert!(
+            res.is_err(),
+            "Session layer memory must require a session ID"
+        );
     }
 
     #[test]
@@ -345,7 +624,10 @@ mod tests {
             vec![],
         );
         assert!(res1.is_err());
-        assert_eq!(res1.unwrap_err().to_string(), "Session ID is required for Session layer memory");
+        assert_eq!(
+            res1.unwrap_err().to_string(),
+            "Session ID is required for Session layer memory"
+        );
 
         let res2 = manager.store(
             MemoryLayer::Session,
@@ -354,7 +636,10 @@ mod tests {
             vec![],
         );
         assert!(res2.is_err());
-        assert_eq!(res2.unwrap_err().to_string(), "Session ID is required for Session layer memory");
+        assert_eq!(
+            res2.unwrap_err().to_string(),
+            "Session ID is required for Session layer memory"
+        );
     }
 
     #[test]
@@ -368,13 +653,16 @@ mod tests {
             vec![],
         );
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err().to_string(), "Session ID must not be provided for non-Session layer memory");
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            "Session ID must not be provided for non-Session layer memory"
+        );
     }
 
     #[test]
     fn test_edge_case_large_text() -> Result<()> {
         let mut manager = MemoryManager::new(":memory:")?;
-        
+
         // Construct a very large text entry (approx. 50,000 characters)
         let mut large_content = "start ".to_string();
         for _ in 0..10000 {
@@ -407,8 +695,14 @@ mod tests {
 
         // Creating association between non-existent IDs should fail now due to foreign keys
         let res = manager.create_association(source, target, rel);
-        assert!(res.is_err(), "Should fail to create association between non-existent memory IDs");
-        assert!(res.unwrap_err().to_string().contains("Source memory with ID 'non-existent-source-id' not found"));
+        assert!(
+            res.is_err(),
+            "Should fail to create association between non-existent memory IDs"
+        );
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Source memory with ID 'non-existent-source-id' not found"));
 
         // Now store them so they exist
         let id_src = manager.store(
@@ -427,7 +721,10 @@ mod tests {
         // Creating association with target missing should also fail
         let res_tgt_missing = manager.create_association(&id_src, "non-existent-target", rel);
         assert!(res_tgt_missing.is_err());
-        assert!(res_tgt_missing.unwrap_err().to_string().contains("Target memory with ID 'non-existent-target' not found"));
+        assert!(res_tgt_missing
+            .unwrap_err()
+            .to_string()
+            .contains("Target memory with ID 'non-existent-target' not found"));
 
         manager.create_association(&id_src, &id_tgt, rel)?;
 
@@ -441,7 +738,10 @@ mod tests {
         // Querying associations for a non-existent source should fail
         let res_query_missing = manager.get_associations("non-existent-source-id", None);
         assert!(res_query_missing.is_err());
-        assert!(res_query_missing.unwrap_err().to_string().contains("Source memory with ID 'non-existent-source-id' not found"));
+        assert!(res_query_missing
+            .unwrap_err()
+            .to_string()
+            .contains("Source memory with ID 'non-existent-source-id' not found"));
 
         Ok(())
     }
@@ -475,7 +775,10 @@ mod tests {
         // Associating different session memories should fail
         let res = manager.create_association(&id_s1, &id_s2, "related");
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("Cross-session association is prohibited"));
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Cross-session association is prohibited"));
 
         Ok(())
     }
@@ -484,33 +787,32 @@ mod tests {
     fn test_invalid_relation_type_and_self_associations() -> Result<()> {
         let mut manager = MemoryManager::new(":memory:")?;
 
-        let id_src = manager.store(
-            MemoryLayer::Rule,
-            None,
-            "Source node".to_string(),
-            vec![],
-        )?;
-        let id_tgt = manager.store(
-            MemoryLayer::Rule,
-            None,
-            "Target node".to_string(),
-            vec![],
-        )?;
+        let id_src = manager.store(MemoryLayer::Rule, None, "Source node".to_string(), vec![])?;
+        let id_tgt = manager.store(MemoryLayer::Rule, None, "Target node".to_string(), vec![])?;
 
         // 1. Empty relation_type
         let res_empty = manager.create_association(&id_src, &id_tgt, "");
         assert!(res_empty.is_err());
-        assert_eq!(res_empty.unwrap_err().to_string(), "Relation type cannot be empty or whitespace-only");
+        assert_eq!(
+            res_empty.unwrap_err().to_string(),
+            "Relation type cannot be empty or whitespace-only"
+        );
 
         // 2. Whitespace-only relation_type
         let res_space = manager.create_association(&id_src, &id_tgt, "   ");
         assert!(res_space.is_err());
-        assert_eq!(res_space.unwrap_err().to_string(), "Relation type cannot be empty or whitespace-only");
+        assert_eq!(
+            res_space.unwrap_err().to_string(),
+            "Relation type cannot be empty or whitespace-only"
+        );
 
         // 3. Self-referential association
         let res_self = manager.create_association(&id_src, &id_src, "depends_on");
         assert!(res_self.is_err());
-        assert!(res_self.unwrap_err().to_string().contains("Self-referential associations are not allowed"));
+        assert!(res_self
+            .unwrap_err()
+            .to_string()
+            .contains("Self-referential associations are not allowed"));
 
         Ok(())
     }
@@ -543,8 +845,12 @@ mod tests {
         // Query both for A -> should return both
         let both = manager.get_associations(&id_a, Some("both"))?;
         assert_eq!(both.len(), 2);
-        assert!(both.iter().any(|assoc| assoc.source_id == id_a && assoc.target_id == id_b));
-        assert!(both.iter().any(|assoc| assoc.source_id == id_c && assoc.target_id == id_a));
+        assert!(both
+            .iter()
+            .any(|assoc| assoc.source_id == id_a && assoc.target_id == id_b));
+        assert!(both
+            .iter()
+            .any(|assoc| assoc.source_id == id_c && assoc.target_id == id_a));
 
         // Invalid direction parameter should fail
         let err_dir = manager.get_associations(&id_a, Some("invalid_dir"));
@@ -556,8 +862,13 @@ mod tests {
     #[test]
     fn test_get_memory_by_id_feature() -> Result<()> {
         let mut manager = MemoryManager::new(":memory:")?;
-        let id = manager.store(MemoryLayer::Rule, None, "Testing get_memory_by_id".to_string(), vec![])?;
-        
+        let id = manager.store(
+            MemoryLayer::Rule,
+            None,
+            "Testing get_memory_by_id".to_string(),
+            vec![],
+        )?;
+
         let retrieved = manager.get_memory_by_id(&id, None)?;
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().content, "Testing get_memory_by_id");
@@ -625,14 +936,12 @@ mod tests {
         assert_eq!(entry.evaluation_score, 0.1);
 
         // Verify error when evaluating non-Experience memory or non-existent memory
-        let id_rule = manager.store(
-            MemoryLayer::Rule,
-            None,
-            "A rule memory".to_string(),
-            vec![],
-        )?;
+        let id_rule =
+            manager.store(MemoryLayer::Rule, None, "A rule memory".to_string(), vec![])?;
         assert!(manager.evaluate_experience(&id_rule, true).is_err());
-        assert!(manager.evaluate_experience("non-existent-id", true).is_err());
+        assert!(manager
+            .evaluate_experience("non-existent-id", true)
+            .is_err());
 
         Ok(())
     }
@@ -678,13 +987,16 @@ mod tests {
         let results = manager.retrieve("macros", Some("session-1".to_string()))?;
         // Both should match, but fresh should have a higher score than decayed due to decay factor
         assert_eq!(results.len(), 2);
-        
+
         let fresh_retrieved = results.iter().find(|r| r.memory.id == id_fresh).unwrap();
         let decayed_retrieved = results.iter().find(|r| r.memory.id == id_decayed).unwrap();
 
-        assert!(fresh_retrieved.final_score > decayed_retrieved.final_score, 
-            "Fresh score {} should be greater than decayed score {}", 
-            fresh_retrieved.final_score, decayed_retrieved.final_score);
+        assert!(
+            fresh_retrieved.final_score > decayed_retrieved.final_score,
+            "Fresh score {} should be greater than decayed score {}",
+            fresh_retrieved.final_score,
+            decayed_retrieved.final_score
+        );
 
         Ok(())
     }
@@ -703,14 +1015,20 @@ mod tests {
 
         // Query with synonyms, no overlapping words
         let results = manager.retrieve("coder software construction language preference", None)?;
-        
-        let query_emb = manager.embedding_manager.generate_query_embedding("test").unwrap_or_default();
+
+        let query_emb = manager
+            .embedding_manager
+            .generate_query_embedding("test")
+            .unwrap_or_default();
         if !query_emb.is_empty() {
             assert!(!results.is_empty(), "Should retrieve memory via semantic search even with synonyms when embedding model is loaded");
             assert_eq!(results[0].memory.id, id);
         } else {
             // If fastembed couldn't initialize (e.g. no internet/offline caching), it should return empty results
-            assert!(results.is_empty(), "Results should be empty when embedding generation fails/returns empty");
+            assert!(
+                results.is_empty(),
+                "Results should be empty when embedding generation fails/returns empty"
+            );
         }
 
         Ok(())
@@ -721,7 +1039,7 @@ mod tests {
         let mut manager = MemoryManager::new(":memory:")?;
 
         // Memory A has exact keyword matches but less semantic alignment for a general concept
-        let id_a = manager.store(
+        let _id_a = manager.store(
             MemoryLayer::Rule,
             None,
             "banana apple fruit orange".to_string(),
@@ -761,8 +1079,12 @@ mod tests {
                     access_count: 0,
                     evaluation_score: 1.0,
                     embedding: vec![],
+                    status: MemoryStatus::Active,
                 },
                 final_score: std::f64::NAN,
+                size: 0,
+                created_at: String::new(),
+                cumulative_size: 0,
             },
             SearchResult {
                 memory: MemoryEntry {
@@ -776,8 +1098,12 @@ mod tests {
                     access_count: 0,
                     evaluation_score: 1.0,
                     embedding: vec![],
+                    status: MemoryStatus::Active,
                 },
                 final_score: 1.5,
+                size: 0,
+                created_at: String::new(),
+                cumulative_size: 0,
             },
             SearchResult {
                 memory: MemoryEntry {
@@ -791,14 +1117,22 @@ mod tests {
                     access_count: 0,
                     evaluation_score: 1.0,
                     embedding: vec![],
+                    status: MemoryStatus::Active,
                 },
                 final_score: 2.0,
+                size: 0,
+                created_at: String::new(),
+                cumulative_size: 0,
             },
         ];
 
         // This should not panic
-        candidates.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal));
-        
+        candidates.sort_by(|a, b| {
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         // Ensure we can sort without panics.
         assert_eq!(candidates.len(), 3);
     }
@@ -831,16 +1165,28 @@ mod tests {
                     access_count: 0,
                     evaluation_score: 1.0,
                     embedding: vec![],
+                    status: MemoryStatus::Active,
                 },
                 final_score: score,
+                size: 0,
+                created_at: String::new(),
+                cumulative_size: 0,
             });
         }
 
         // Run sort in both directions to verify it never panics
-        candidates.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         assert_eq!(candidates.len(), special_scores.len());
 
-        candidates.sort_by(|a, b| a.final_score.partial_cmp(&b.final_score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            a.final_score
+                .partial_cmp(&b.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         assert_eq!(candidates.len(), special_scores.len());
     }
 
@@ -849,13 +1195,13 @@ mod tests {
         // Create a manager with an invalid cache directory (e.g. pointing to a file)
         // to force fastembed initialization to fail.
         let invalid_cache_dir = std::path::PathBuf::from("Cargo.toml"); // this is a file, not a directory
-        
+
         let storage = SqliteStorage::new(":memory:")?;
         let manager = MemoryManager {
             storage,
             embedding_manager: crate::embedding::EmbeddingManager::new(Some(invalid_cache_dir)),
         };
-        
+
         // Storing a memory should still succeed and print a warning to stderr
         let mut manager = manager;
         let memory_id = manager.store(
@@ -865,16 +1211,18 @@ mod tests {
             vec![],
         )?;
 
-        
         // The stored memory's embedding should be empty
         let stored = manager.storage.get_memory_by_id(&memory_id)?.unwrap();
-        assert!(stored.embedding.is_empty(), "Embedding must be empty on failure");
-        
+        assert!(
+            stored.embedding.is_empty(),
+            "Embedding must be empty on failure"
+        );
+
         // Retrieval should also succeed and return the stored memory based on text matching
         let results = manager.retrieve("Graceful fallback", None)?;
         assert_eq!(results.len(), 1, "Should retrieve via text-search");
         assert_eq!(results[0].memory.id, memory_id);
-        
+
         Ok(())
     }
 
@@ -901,14 +1249,20 @@ mod tests {
         // Query with an irrelevant query (should result in relevance score close to 0)
         // Rule should bypass the 0.15 relevance filter, but Session memory should be filtered out.
         let results = manager.retrieve("banana apple orange", Some("session-123".to_string()))?;
-        
+
         // Assert Rule memory is retrieved
         let rule_retrieved = results.iter().any(|r| r.memory.id == rule_id);
-        assert!(rule_retrieved, "Rule memory should be retrieved despite low relevance");
+        assert!(
+            rule_retrieved,
+            "Rule memory should be retrieved despite low relevance"
+        );
 
         // Assert Session memory is filtered out
         let session_retrieved = results.iter().any(|r| r.memory.id == session_id);
-        assert!(!session_retrieved, "Session memory should be filtered out due to low relevance (< 0.15)");
+        assert!(
+            !session_retrieved,
+            "Session memory should be filtered out due to low relevance (< 0.15)"
+        );
 
         Ok(())
     }
@@ -916,9 +1270,9 @@ mod tests {
     #[test]
     fn test_freq_boost_zero_access_count() -> Result<()> {
         let mut manager = MemoryManager::new(":memory:")?;
-        
+
         // Store a memory
-        let id = manager.store(
+        let _id = manager.store(
             MemoryLayer::Rule,
             None,
             "Verify frequency boost behavior.".to_string(),
@@ -928,10 +1282,16 @@ mod tests {
         // Retrieve it for the first time when its access_count is 0 in the database
         let results = manager.retrieve("frequency boost behavior", None)?;
         assert_eq!(results.len(), 1);
-        
+
         // Verify that the final score is finite and greater than zero (no longer -inf due to log(0) bug)
-        assert!(results[0].final_score.is_finite(), "Initial score for 0 access count should be finite");
-        assert!(results[0].final_score > 0.0, "Initial score for 0 access count should be greater than 0");
+        assert!(
+            results[0].final_score.is_finite(),
+            "Initial score for 0 access count should be finite"
+        );
+        assert!(
+            results[0].final_score > 0.0,
+            "Initial score for 0 access count should be greater than 0"
+        );
 
         Ok(())
     }
@@ -957,15 +1317,24 @@ mod tests {
         // 1. Whitespace relation types
         let res_empty = manager.create_association(&id_a, &id_b, "");
         assert!(res_empty.is_err());
-        assert_eq!(res_empty.unwrap_err().to_string(), "Relation type cannot be empty or whitespace-only");
+        assert_eq!(
+            res_empty.unwrap_err().to_string(),
+            "Relation type cannot be empty or whitespace-only"
+        );
 
         let res_whitespace = manager.create_association(&id_a, &id_b, "   ");
         assert!(res_whitespace.is_err());
-        assert_eq!(res_whitespace.unwrap_err().to_string(), "Relation type cannot be empty or whitespace-only");
+        assert_eq!(
+            res_whitespace.unwrap_err().to_string(),
+            "Relation type cannot be empty or whitespace-only"
+        );
 
         let res_tab_newline = manager.create_association(&id_a, &id_b, "\n\t");
         assert!(res_tab_newline.is_err());
-        assert_eq!(res_tab_newline.unwrap_err().to_string(), "Relation type cannot be empty or whitespace-only");
+        assert_eq!(
+            res_tab_newline.unwrap_err().to_string(),
+            "Relation type cannot be empty or whitespace-only"
+        );
 
         // Trimmed relation type success
         manager.create_association(&id_a, &id_b, "   related_to \n  ")?;
@@ -976,7 +1345,10 @@ mod tests {
         // 2. Self-associations
         let res_self = manager.create_association(&id_a, &id_a, "depends_on");
         assert!(res_self.is_err());
-        assert!(res_self.unwrap_err().to_string().contains("Self-referential associations are not allowed"));
+        assert!(res_self
+            .unwrap_err()
+            .to_string()
+            .contains("Self-referential associations are not allowed"));
 
         // 3. Bidirectional direction edge cases
         // Test valid directions
@@ -992,28 +1364,48 @@ mod tests {
         // Test invalid/case-sensitive direction values
         let res_caps = manager.get_associations(&id_a, Some("OUTGOING"));
         assert!(res_caps.is_err());
-        assert!(res_caps.unwrap_err().to_string().contains("Invalid direction: 'OUTGOING'"));
+        assert!(res_caps
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid direction: 'OUTGOING'"));
 
         let res_mixed = manager.get_associations(&id_a, Some("Incoming"));
         assert!(res_mixed.is_err());
-        assert!(res_mixed.unwrap_err().to_string().contains("Invalid direction: 'Incoming'"));
+        assert!(res_mixed
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid direction: 'Incoming'"));
 
         let res_padded = manager.get_associations(&id_a, Some(" both "));
         assert!(res_padded.is_err());
-        assert!(res_padded.unwrap_err().to_string().contains("Invalid direction: ' both '"));
+        assert!(res_padded
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid direction: ' both '"));
 
         // 4. Missing nodes
-        let res_missing_target = manager.create_association(&id_a, "missing-target-id", "depends_on");
+        let res_missing_target =
+            manager.create_association(&id_a, "missing-target-id", "depends_on");
         assert!(res_missing_target.is_err());
-        assert!(res_missing_target.unwrap_err().to_string().contains("Target memory with ID 'missing-target-id' not found"));
+        assert!(res_missing_target
+            .unwrap_err()
+            .to_string()
+            .contains("Target memory with ID 'missing-target-id' not found"));
 
-        let res_missing_source = manager.create_association("missing-source-id", &id_b, "depends_on");
+        let res_missing_source =
+            manager.create_association("missing-source-id", &id_b, "depends_on");
         assert!(res_missing_source.is_err());
-        assert!(res_missing_source.unwrap_err().to_string().contains("Source memory with ID 'missing-source-id' not found"));
+        assert!(res_missing_source
+            .unwrap_err()
+            .to_string()
+            .contains("Source memory with ID 'missing-source-id' not found"));
 
         let res_get_missing_source = manager.get_associations("missing-source-id", Some("both"));
         assert!(res_get_missing_source.is_err());
-        assert!(res_get_missing_source.unwrap_err().to_string().contains("Source memory with ID 'missing-source-id' not found"));
+        assert!(res_get_missing_source
+            .unwrap_err()
+            .to_string()
+            .contains("Source memory with ID 'missing-source-id' not found"));
 
         Ok(())
     }
@@ -1082,10 +1474,20 @@ mod tests {
     #[test]
     fn test_milestone5_non_experience_layer_rejection() -> Result<()> {
         let mut manager = MemoryManager::new(":memory:")?;
-        
+
         let id_rule = manager.store(MemoryLayer::Rule, None, "Rule content".to_string(), vec![])?;
-        let id_persona = manager.store(MemoryLayer::Persona, None, "Persona content".to_string(), vec![])?;
-        let id_session = manager.store(MemoryLayer::Session, Some("session-abc".to_string()), "Session content".to_string(), vec![])?;
+        let id_persona = manager.store(
+            MemoryLayer::Persona,
+            None,
+            "Persona content".to_string(),
+            vec![],
+        )?;
+        let id_session = manager.store(
+            MemoryLayer::Session,
+            Some("session-abc".to_string()),
+            "Session content".to_string(),
+            vec![],
+        )?;
 
         // Evaluating non-Experience layers returns error
         assert!(manager.evaluate_experience(&id_rule, true).is_err());
@@ -1093,9 +1495,30 @@ mod tests {
         assert!(manager.evaluate_experience(&id_session, true).is_err());
 
         // Their scores remain 1.0
-        assert_eq!(manager.storage.get_memory_by_id(&id_rule)?.unwrap().evaluation_score, 1.0);
-        assert_eq!(manager.storage.get_memory_by_id(&id_persona)?.unwrap().evaluation_score, 1.0);
-        assert_eq!(manager.storage.get_memory_by_id(&id_session)?.unwrap().evaluation_score, 1.0);
+        assert_eq!(
+            manager
+                .storage
+                .get_memory_by_id(&id_rule)?
+                .unwrap()
+                .evaluation_score,
+            1.0
+        );
+        assert_eq!(
+            manager
+                .storage
+                .get_memory_by_id(&id_persona)?
+                .unwrap()
+                .evaluation_score,
+            1.0
+        );
+        assert_eq!(
+            manager
+                .storage
+                .get_memory_by_id(&id_session)?
+                .unwrap()
+                .evaluation_score,
+            1.0
+        );
 
         Ok(())
     }
@@ -1103,7 +1526,7 @@ mod tests {
     #[test]
     fn test_milestone5_database_constraint_isolation() -> Result<()> {
         let storage = SqliteStorage::new(":memory:")?;
-        
+
         // 1. Session layer with session_id = None must fail due to check_session_id
         let entry_invalid_session = MemoryEntry {
             id: "session-fail".to_string(),
@@ -1116,6 +1539,7 @@ mod tests {
             access_count: 0,
             evaluation_score: 1.0,
             embedding: vec![],
+            status: MemoryStatus::Active,
         };
         assert!(storage.insert_memory(&entry_invalid_session).is_err());
 
@@ -1131,6 +1555,7 @@ mod tests {
             access_count: 0,
             evaluation_score: 1.0,
             embedding: vec![],
+            status: MemoryStatus::Active,
         };
         assert!(storage.insert_memory(&entry_invalid_rule).is_err());
 
@@ -1146,6 +1571,7 @@ mod tests {
             access_count: 0,
             evaluation_score: -0.5,
             embedding: vec![],
+            status: MemoryStatus::Active,
         };
         assert!(storage.insert_memory(&entry_neg_score).is_err());
 
@@ -1163,11 +1589,16 @@ mod tests {
     #[tokio::test]
     async fn test_milestone5_concurrency_safety() -> Result<()> {
         let manager = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(":memory:")?));
-        
+
         // Store an experience memory
         let exp_id = {
             let mut mgr = manager.lock().await;
-            mgr.store(MemoryLayer::Experience, None, "Concurrent evolution test".to_string(), vec![])?
+            mgr.store(
+                MemoryLayer::Experience,
+                None,
+                "Concurrent evolution test".to_string(),
+                vec![],
+            )?
         };
 
         // Spawn 20 tasks that concurrently query/evolve the experience memory
@@ -1178,10 +1609,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let success = i % 2 == 0;
                 let mut mgr = manager_clone.lock().await;
-                
+
                 // Do a retrieve
                 let _ = mgr.retrieve("evolution test", None).unwrap();
-                
+
                 // Do an evaluation
                 mgr.evaluate_experience(&exp_id_clone, success).unwrap();
             });
@@ -1203,7 +1634,7 @@ mod tests {
     #[test]
     fn test_milestone5_search_dominance_and_starvation_resistance() -> Result<()> {
         let mut manager = MemoryManager::new(":memory:")?;
-        
+
         // 1. Insert Rule memory R (with a small matching content)
         let id_r = manager.store(
             MemoryLayer::Rule,
@@ -1233,7 +1664,8 @@ mod tests {
         )?;
 
         // Retrieve with the query "Dominance matches query"
-        let results = manager.retrieve("Dominance matches query", Some("session-123".to_string()))?;
+        let results =
+            manager.retrieve("Dominance matches query", Some("session-123".to_string()))?;
 
         // Verify that all three are returned (none is starved out from the top 5)
         let ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
@@ -1247,8 +1679,9 @@ mod tests {
     #[test]
     fn test_milestone5_nan_infinity_input_safety() -> Result<()> {
         // 1. Test NaN/Infinity safety inside EvolutionEngine
-        let engine = crate::evolution::EvolutionEngine::new(crate::evolution::EvolutionConfig::default());
-        
+        let engine =
+            crate::evolution::EvolutionEngine::new(crate::evolution::EvolutionConfig::default());
+
         // If current score is NaN, it should fallback to min_score (0.1)
         let nan_eval = engine.evaluate(std::f64::NAN, true, &MemoryLayer::Experience);
         assert_eq!(nan_eval, 0.1);
@@ -1271,8 +1704,12 @@ mod tests {
                     access_count: 0,
                     evaluation_score: 1.0,
                     embedding: vec![],
+                    status: MemoryStatus::Active,
                 },
                 final_score: std::f64::NAN,
+                size: 0,
+                created_at: String::new(),
+                cumulative_size: 0,
             },
             SearchResult {
                 memory: MemoryEntry {
@@ -1286,8 +1723,12 @@ mod tests {
                     access_count: 0,
                     evaluation_score: 1.0,
                     embedding: vec![],
+                    status: MemoryStatus::Active,
                 },
                 final_score: std::f64::INFINITY,
+                size: 0,
+                created_at: String::new(),
+                cumulative_size: 0,
             },
             SearchResult {
                 memory: MemoryEntry {
@@ -1301,17 +1742,154 @@ mod tests {
                     access_count: 0,
                     evaluation_score: 1.0,
                     embedding: vec![],
+                    status: MemoryStatus::Active,
                 },
                 final_score: 1.2,
+                size: 0,
+                created_at: String::new(),
+                cumulative_size: 0,
             },
         ];
 
         // Should sort without panicking
-        candidates.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         assert_eq!(candidates.len(), 3);
 
         Ok(())
     }
+
+    #[test]
+    fn test_conflict_detection_and_resolution_flow() -> Result<()> {
+        let mut manager = MemoryManager::new(":memory:")?;
+
+        // 1. Store a memory
+        let content_old = "The project uses Postgres 15 database".to_string();
+        let id_old = manager.store(
+            MemoryLayer::Experience,
+            None,
+            content_old.clone(),
+            vec!["database".to_string()],
+        )?;
+
+        // 2. Query conflict candidates for similar content
+        let content_new = "The project database has been upgraded to Postgres 16".to_string();
+        let candidates =
+            manager.get_conflict_candidates(&content_new, None, Some(0.65), Some(5))?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].memory.id, id_old);
+        assert!(candidates[0].similarity > 0.65);
+
+        // 3. Resolve conflict by deprecating old memory and adding new memory and association
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_mem = crate::models::MemoryEntryInput {
+            id: Some(new_id.clone()),
+            layer: MemoryLayer::Experience,
+            session_id: None,
+            content: content_new,
+            tags: vec!["database".to_string()],
+        };
+
+        let new_assoc = crate::models::AssociationInput {
+            source_id: new_id.clone(),
+            target_id: id_old.clone(),
+            relation_type: "replaces".to_string(),
+        };
+
+        let inserted = manager.resolve_conflict(
+            &[id_old.clone()], // deprecate
+            &[],               // delete
+            &[new_mem],        // new memories
+            &[new_assoc],      // new associations
+        )?;
+
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0], new_id);
+
+        // 4. Verify that the deprecated memory status is changed to Deprecated
+        let old_entry = manager.storage.get_memory_by_id(&id_old)?.unwrap();
+        assert_eq!(old_entry.status, MemoryStatus::Deprecated);
+
+        // 5. Verify new memory is Active
+        let new_entry = manager.storage.get_memory_by_id(&new_id)?.unwrap();
+        assert_eq!(new_entry.status, MemoryStatus::Active);
+
+        // 6. Verify association is established
+        let assocs = manager.storage.get_associations(&new_id, "outgoing")?;
+        assert_eq!(assocs.len(), 1);
+        assert_eq!(assocs[0].target_id, id_old);
+        assert_eq!(assocs[0].relation_type, "replaces");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_compaction_and_purging_flow() -> Result<()> {
+        let mut manager = MemoryManager::new(":memory:")?;
+
+        // 1. Store session memories
+        let sid = "session-test".to_string();
+        let id_1 = manager.store(
+            MemoryLayer::Session,
+            Some(sid.clone()),
+            "Memory 1".to_string(),
+            vec![],
+        )?;
+        let id_2 = manager.store(
+            MemoryLayer::Session,
+            Some(sid.clone()),
+            "Memory 2".to_string(),
+            vec![],
+        )?;
+        let id_3 = manager.store(
+            MemoryLayer::Session,
+            Some(sid.clone()),
+            "Memory 3".to_string(),
+            vec![],
+        )?;
+
+        // 2. Retrieve session memories
+        let session_mems = manager.get_session_memories(&sid, None)?;
+        assert_eq!(session_mems.len(), 3);
+        assert_eq!(session_mems[0].id, id_1);
+        assert_eq!(session_mems[1].id, id_2);
+        assert_eq!(session_mems[2].id, id_3);
+
+        // 3. Purge session, preserving id_2 (soft deprecation)
+        let count = manager.purge_session_memories(&sid, &[id_2.clone()], false)?;
+        assert_eq!(count, 2); // id_1 and id_3 are soft deprecated
+
+        // Check statuses
+        assert_eq!(
+            manager.storage.get_memory_by_id(&id_1)?.unwrap().status,
+            MemoryStatus::Deprecated
+        );
+        assert_eq!(
+            manager.storage.get_memory_by_id(&id_2)?.unwrap().status,
+            MemoryStatus::Active
+        );
+        assert_eq!(
+            manager.storage.get_memory_by_id(&id_3)?.unwrap().status,
+            MemoryStatus::Deprecated
+        );
+
+        // Active retrieve should only return preserved memory
+        let active_mems = manager.get_session_memories(&sid, None)?;
+        assert_eq!(active_mems.len(), 1);
+        assert_eq!(active_mems[0].id, id_2);
+
+        // 4. Permanently purge the deprecated session memories
+        let count_perm = manager.purge_session_memories(&sid, &[id_2.clone()], true)?;
+        assert_eq!(count_perm, 2);
+
+        // They must be completely gone
+        assert!(manager.storage.get_memory_by_id(&id_1)?.is_none());
+        assert!(manager.storage.get_memory_by_id(&id_3)?.is_none());
+        assert!(manager.storage.get_memory_by_id(&id_2)?.is_some());
+
+        Ok(())
+    }
 }
-
-

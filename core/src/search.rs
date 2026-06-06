@@ -1,15 +1,11 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32> {
     if a.is_empty() || b.is_empty() {
         return Err(anyhow!("Vectors cannot be empty"));
     }
     if a.len() != b.len() {
-        return Err(anyhow!(
-            "Dimension mismatch: {} vs {}",
-            a.len(),
-            b.len()
-        ));
+        return Err(anyhow!("Dimension mismatch: {} vs {}", a.len(), b.len()));
     }
 
     let mut dot_product = 0.0;
@@ -144,8 +140,8 @@ mod tests {
             -0.0,
             1.0,
             -1.0,
-            1e-45,     // extremely small f32
-            1e38,      // extremely large f32
+            1e-45, // extremely small f32
+            1e38,  // extremely large f32
             std::f32::INFINITY,
             std::f32::NEG_INFINITY,
             std::f32::NAN,
@@ -160,8 +156,19 @@ mod tests {
                         let res = cosine_similarity(&a, &b);
                         match res {
                             Ok(sim) => {
-                                assert!(!sim.is_nan(), "Similarity must not be NaN for inputs {:?}, {:?}", a, b);
-                                assert!(sim >= -1.0 && sim <= 1.0, "Similarity {} out of bounds for inputs {:?}, {:?}", sim, a, b);
+                                assert!(
+                                    !sim.is_nan(),
+                                    "Similarity must not be NaN for inputs {:?}, {:?}",
+                                    a,
+                                    b
+                                );
+                                assert!(
+                                    sim >= -1.0 && sim <= 1.0,
+                                    "Similarity {} out of bounds for inputs {:?}, {:?}",
+                                    sim,
+                                    a,
+                                    b
+                                );
                             }
                             Err(_) => {}
                         }

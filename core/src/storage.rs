@@ -1,8 +1,8 @@
-use rusqlite::{Connection, params};
-use std::path::Path;
-use anyhow::{Result, Context};
-use crate::models::{MemoryEntry, MemoryLayer, Association};
+use crate::models::{Association, MemoryEntry, MemoryLayer};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
+use std::path::Path;
 
 pub struct SqliteStorage {
     pub conn: Connection,
@@ -12,15 +12,14 @@ impl SqliteStorage {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-        
+
         // Enable WAL mode & foreign keys
         conn.pragma_update(None, "journal_mode", &"WAL")?;
         conn.pragma_update(None, "foreign_keys", &"ON")?;
 
-
         let storage = SqliteStorage { conn };
         storage.initialize_tables()?;
-        
+
         Ok(storage)
     }
 
@@ -38,12 +37,14 @@ impl SqliteStorage {
                 last_accessed TEXT NOT NULL,
                 access_count INTEGER NOT NULL DEFAULT 0,
                 evaluation_score REAL NOT NULL DEFAULT 1.0,
+                status TEXT NOT NULL DEFAULT 'Active',
                 CONSTRAINT check_layer CHECK (layer IN ('Rule', 'Persona', 'Experience', 'Session')),
                 CONSTRAINT check_session_id CHECK (
                     (layer = 'Session' AND session_id IS NOT NULL AND length(session_id) > 0) OR
                     (layer != 'Session' AND session_id IS NULL)
                 ),
-                CONSTRAINT check_evaluation_score CHECK (evaluation_score >= 0.0)
+                CONSTRAINT check_evaluation_score CHECK (evaluation_score >= 0.0),
+                CONSTRAINT check_status CHECK (status IN ('Active', 'Deprecated', 'PendingResolution'))
             );",
             [],
         ).context("Failed to create memories table")?;
@@ -54,14 +55,42 @@ impl SqliteStorage {
             [],
         ).context("Failed to create idx_memories_layer_session")?;
 
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at);",
-            [],
-        ).context("Failed to create idx_memories_created_at")?;
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at);",
+                [],
+            )
+            .context("Failed to create idx_memories_created_at")?;
+
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (status);",
+                [],
+            )
+            .context("Failed to create idx_memories_status")?;
+
+        // Dynamic migration for status column for existing DBs
+        let has_status = self
+            .conn
+            .prepare("PRAGMA table_info(memories);")?
+            .query_map([], |row| Ok(row.get::<_, String>(1)?))?
+            .any(|name_res| name_res.map(|name| name == "status").unwrap_or(false));
+
+        if !has_status {
+            self.conn.execute(
+                "ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'Active';",
+                [],
+            )?;
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (status);",
+                [],
+            )?;
+        }
 
         // Create graph_associations with strict SQLite foreign keys targeting memories(id) with ON DELETE CASCADE
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS graph_associations (
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS graph_associations (
                 source_id TEXT NOT NULL,
                 target_id TEXT NOT NULL,
                 relation_type TEXT NOT NULL,
@@ -70,8 +99,9 @@ impl SqliteStorage {
                 FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
                 FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE
             );",
-            [],
-        ).context("Failed to create graph_associations table")?;
+                [],
+            )
+            .context("Failed to create graph_associations table")?;
 
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_graph_associations_target ON graph_associations(target_id);",
@@ -92,29 +122,59 @@ impl SqliteStorage {
         let last_accessed_str: String = row.get(7)?;
         let access_count: u32 = row.get(8)?;
         let evaluation_score: f64 = row.get(9)?;
+        let status_str: String = row.get(10)?;
 
         let layer = match layer_str.as_str() {
             "Rule" | "Principle" => MemoryLayer::Rule,
             "Persona" => MemoryLayer::Persona,
             "Experience" => MemoryLayer::Experience,
             "Session" => MemoryLayer::Session,
-            _ => return Err(rusqlite::Error::FromSqlConversionFailure(
-                1,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Unknown layer: {}", layer_str))),
-            )),
+            _ => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Unknown layer: {}", layer_str),
+                    )),
+                ))
+            }
+        };
+
+        let status = match status_str.as_str() {
+            "Active" => crate::models::MemoryStatus::Active,
+            "Deprecated" => crate::models::MemoryStatus::Deprecated,
+            "PendingResolution" => crate::models::MemoryStatus::PendingResolution,
+            _ => crate::models::MemoryStatus::Active,
         };
 
         let created_at = DateTime::parse_from_rfc3339(&created_at_str)
             .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e)))?;
-        
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
         let last_accessed = DateTime::parse_from_rfc3339(&last_accessed_str)
             .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e)))?;
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
 
-        let embedding = bytes_to_f32_vec(&embedding_bytes)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Blob, Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))))?;
+        let embedding = bytes_to_f32_vec(&embedding_bytes).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            )
+        })?;
 
         Ok(MemoryEntry {
             id,
@@ -127,6 +187,7 @@ impl SqliteStorage {
             access_count,
             evaluation_score,
             embedding,
+            status,
         })
     }
 
@@ -141,10 +202,11 @@ impl SqliteStorage {
         let embedding_bytes = f32_vec_to_bytes(&entry.embedding);
         let created_at_str = entry.created_at.to_rfc3339();
         let last_accessed_str = entry.last_accessed.to_rfc3339();
+        let status_str = entry.status.to_string();
 
         self.conn.execute(
-            "INSERT INTO memories (id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO memories (id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 entry.id,
                 layer_str,
@@ -155,7 +217,8 @@ impl SqliteStorage {
                 created_at_str,
                 last_accessed_str,
                 entry.access_count,
-                entry.evaluation_score
+                entry.evaluation_score,
+                status_str
             ],
         )?;
         Ok(())
@@ -172,9 +235,10 @@ impl SqliteStorage {
         let embedding_bytes = f32_vec_to_bytes(&entry.embedding);
         let created_at_str = entry.created_at.to_rfc3339();
         let last_accessed_str = entry.last_accessed.to_rfc3339();
+        let status_str = entry.status.to_string();
 
         self.conn.execute(
-            "UPDATE memories SET layer = ?2, session_id = ?3, content = ?4, tags = ?5, embedding = ?6, last_accessed = ?7, access_count = ?8, evaluation_score = ?9, created_at = ?10 WHERE id = ?1",
+            "UPDATE memories SET layer = ?2, session_id = ?3, content = ?4, tags = ?5, embedding = ?6, last_accessed = ?7, access_count = ?8, evaluation_score = ?9, created_at = ?10, status = ?11 WHERE id = ?1",
             params![
                 entry.id,
                 layer_str,
@@ -185,7 +249,8 @@ impl SqliteStorage {
                 last_accessed_str,
                 entry.access_count,
                 entry.evaluation_score,
-                created_at_str
+                created_at_str,
+                status_str
             ],
         )?;
         Ok(())
@@ -205,7 +270,7 @@ impl SqliteStorage {
 
     pub fn get_memory_by_id(&self, id: &str) -> Result<Option<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score FROM memories WHERE id = ?1"
+            "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score, status FROM memories WHERE id = ?1"
         )?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
@@ -217,7 +282,7 @@ impl SqliteStorage {
 
     pub fn load_all_memories(&self) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score FROM memories"
+            "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score, status FROM memories WHERE status = 'Active'"
         )?;
         let rows = stmt.query_map([], |row| self.row_to_memory(row))?;
         let mut results = Vec::new();
@@ -230,19 +295,19 @@ impl SqliteStorage {
     pub fn get_relevant_memories(&self, session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
         let mut stmt = if let Some(_) = session_id {
             self.conn.prepare(
-                "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score 
+                "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score, status 
                  FROM memories 
-                 WHERE layer IN ('Rule', 'Persona', 'Experience')
+                 WHERE layer IN ('Rule', 'Persona', 'Experience') AND status = 'Active'
                  UNION ALL
-                 SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score 
-                 FROM memories 
-                 WHERE layer = 'Session' AND session_id = ?1"
+                 SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score, status 
+                 FROM memories INDEXED BY idx_memories_layer_session
+                 WHERE layer = 'Session' AND session_id = ?1 AND status = 'Active'"
             )?
         } else {
             self.conn.prepare(
-                "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score 
+                "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score, status 
                  FROM memories 
-                 WHERE layer IN ('Rule', 'Persona', 'Experience')"
+                 WHERE layer IN ('Rule', 'Persona', 'Experience') AND status = 'Active'"
             )?
         };
 
@@ -259,7 +324,119 @@ impl SqliteStorage {
             }
         }
         Ok(results)
+    }
 
+    pub fn execute_transactional_resolution(
+        &self,
+        deprecate_ids: &[String],
+        delete_ids: &[String],
+        new_entries: &[MemoryEntry],
+        associations: &[Association],
+    ) -> Result<()> {
+        self.conn.execute("BEGIN TRANSACTION;", [])?;
+
+        // 1. Soft-deprecate
+        for id in deprecate_ids {
+            let res = self.conn.execute(
+                "UPDATE memories SET status = 'Deprecated' WHERE id = ?1",
+                params![id],
+            );
+            if let Err(e) = res {
+                let _ = self.conn.execute("ROLLBACK;", []);
+                return Err(anyhow::anyhow!("Failed to deprecate memory {}: {}", id, e));
+            }
+        }
+
+        // 2. Delete
+        for id in delete_ids {
+            let res = self
+                .conn
+                .execute("DELETE FROM memories WHERE id = ?1", params![id]);
+            if let Err(e) = res {
+                let _ = self.conn.execute("ROLLBACK;", []);
+                return Err(anyhow::anyhow!("Failed to delete memory {}: {}", id, e));
+            }
+        }
+
+        // 3. Insert new memories
+        for entry in new_entries {
+            if let Err(e) = self.insert_memory(entry) {
+                let _ = self.conn.execute("ROLLBACK;", []);
+                return Err(anyhow::anyhow!(
+                    "Failed to insert memory {}: {}",
+                    entry.id,
+                    e
+                ));
+            }
+        }
+
+        // 4. Create associations
+        for assoc in associations {
+            if let Err(e) = self.create_association(assoc) {
+                let _ = self.conn.execute("ROLLBACK;", []);
+                return Err(anyhow::anyhow!(
+                    "Failed to create association from {} to {}: {}",
+                    assoc.source_id,
+                    assoc.target_id,
+                    e
+                ));
+            }
+        }
+
+        self.conn.execute("COMMIT;", [])?;
+        Ok(())
+    }
+
+    pub fn get_session_memories(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let mut query = "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score, status 
+                         FROM memories 
+                         WHERE layer = 'Session' AND session_id = ?1 AND status = 'Active' 
+                         ORDER BY created_at ASC".to_string();
+        if let Some(lim) = limit {
+            query.push_str(&format!(" LIMIT {}", lim));
+        }
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map(params![session_id], |row| self.row_to_memory(row))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    pub fn purge_session_memories(
+        &self,
+        session_id: &str,
+        preserve_ids: &[String],
+        permanent: bool,
+    ) -> Result<usize> {
+        let mut query = if permanent {
+            "DELETE FROM memories WHERE layer = 'Session' AND session_id = ?1".to_string()
+        } else {
+            "UPDATE memories SET status = 'Deprecated' WHERE layer = 'Session' AND session_id = ?1"
+                .to_string()
+        };
+
+        if !preserve_ids.is_empty() {
+            let placeholders: Vec<String> = (0..preserve_ids.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect();
+            query.push_str(&format!(" AND id NOT IN ({})", placeholders.join(",")));
+        }
+
+        let mut stmt = self.conn.prepare(&query)?;
+
+        let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&session_id];
+        for id in preserve_ids {
+            sql_params.push(id);
+        }
+        let count = stmt.execute(sql_params.as_slice())?;
+        Ok(count)
     }
 
     pub fn create_association(&self, assoc: &Association) -> Result<()> {
@@ -293,11 +470,13 @@ impl SqliteStorage {
             let created_at_str: String = row.get(3)?;
             let created_at = DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))?;
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             Ok(Association {
                 source_id: row.get(0)?,
                 target_id: row.get(1)?,
@@ -305,7 +484,7 @@ impl SqliteStorage {
                 created_at,
             })
         })?;
-        
+
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -342,6 +521,7 @@ mod tests {
     #[test]
     fn test_in_memory_db_and_insert_retrieve() -> Result<()> {
         let storage = SqliteStorage::new(":memory:")?;
+        use crate::models::MemoryStatus;
 
         // 1. Test insert and retrieval of rule
         let entry1 = MemoryEntry {
@@ -355,6 +535,7 @@ mod tests {
             access_count: 0,
             evaluation_score: 1.0,
             embedding: vec![0.1, 0.2, 0.3],
+            status: MemoryStatus::Active,
         };
         storage.insert_memory(&entry1)?;
 
@@ -362,8 +543,12 @@ mod tests {
         assert_eq!(retrieved1.id, "rule-1");
         assert_eq!(retrieved1.layer, MemoryLayer::Rule);
         assert_eq!(retrieved1.content, "Always reply politely.");
-        assert_eq!(retrieved1.tags, vec!["politeness".to_string(), "rules".to_string()]);
+        assert_eq!(
+            retrieved1.tags,
+            vec!["politeness".to_string(), "rules".to_string()]
+        );
         assert_eq!(retrieved1.embedding, vec![0.1, 0.2, 0.3]);
+        assert_eq!(retrieved1.status, MemoryStatus::Active);
 
         // 2. Test insert and retrieval of session memory
         let entry2 = MemoryEntry {
@@ -377,6 +562,7 @@ mod tests {
             access_count: 1,
             evaluation_score: 1.0,
             embedding: vec![],
+            status: MemoryStatus::Active,
         };
         storage.insert_memory(&entry2)?;
 
@@ -385,6 +571,7 @@ mod tests {
         assert_eq!(retrieved2.session_id, Some("session-abc".to_string()));
         assert_eq!(retrieved2.content, "User said they like rust.");
         assert_eq!(retrieved2.embedding.len(), 0);
+        assert_eq!(retrieved2.status, MemoryStatus::Active);
 
         // 3. Test load all memories
         let all = storage.load_all_memories()?;
@@ -415,6 +602,7 @@ mod tests {
             access_count: 0,
             evaluation_score: 2.5,
             embedding: vec![],
+            status: MemoryStatus::Active,
         };
         storage.insert_memory(&entry3)?;
 
@@ -434,6 +622,7 @@ mod tests {
     #[test]
     fn test_graph_associations() -> Result<()> {
         let storage = SqliteStorage::new(":memory:")?;
+        use crate::models::MemoryStatus;
 
         // Insert memories first to satisfy foreign key constraints
         let mem_a = MemoryEntry {
@@ -447,6 +636,7 @@ mod tests {
             access_count: 0,
             evaluation_score: 1.0,
             embedding: vec![],
+            status: MemoryStatus::Active,
         };
         let mem_b = MemoryEntry {
             id: "node-b".to_string(),
@@ -459,6 +649,7 @@ mod tests {
             access_count: 0,
             evaluation_score: 1.0,
             embedding: vec![],
+            status: MemoryStatus::Active,
         };
         let mem_c = MemoryEntry {
             id: "node-c".to_string(),
@@ -471,6 +662,7 @@ mod tests {
             access_count: 0,
             evaluation_score: 1.0,
             embedding: vec![],
+            status: MemoryStatus::Active,
         };
         storage.insert_memory(&mem_a)?;
         storage.insert_memory(&mem_b)?;
@@ -494,11 +686,17 @@ mod tests {
 
         let assocs = storage.get_associations("node-a", "outgoing")?;
         assert_eq!(assocs.len(), 2);
-        assert!(assocs.iter().any(|a| a.target_id == "node-b" && a.relation_type == "related_to"));
-        assert!(assocs.iter().any(|a| a.target_id == "node-c" && a.relation_type == "depends_on"));
+        assert!(assocs
+            .iter()
+            .any(|a| a.target_id == "node-b" && a.relation_type == "related_to"));
+        assert!(assocs
+            .iter()
+            .any(|a| a.target_id == "node-c" && a.relation_type == "depends_on"));
 
         // Verify ON DELETE CASCADE
-        storage.conn.execute("DELETE FROM memories WHERE id = 'node-b'", [])?;
+        storage
+            .conn
+            .execute("DELETE FROM memories WHERE id = 'node-b'", [])?;
         let assocs = storage.get_associations("node-a", "outgoing")?;
         assert_eq!(assocs.len(), 1);
         assert_eq!(assocs[0].target_id, "node-c");
@@ -509,6 +707,7 @@ mod tests {
     #[test]
     fn test_query_plan_and_performance() -> Result<()> {
         let storage = SqliteStorage::new(":memory:")?;
+        use crate::models::MemoryStatus;
 
         // Insert 100 Rule, 100 Persona, 100 Experience, and 1000 Session memories (across 10 different sessions)
         for i in 0..100 {
@@ -523,6 +722,7 @@ mod tests {
                 access_count: 0,
                 evaluation_score: 1.0,
                 embedding: vec![],
+                status: MemoryStatus::Active,
             })?;
             storage.insert_memory(&MemoryEntry {
                 id: format!("persona-{}", i),
@@ -535,6 +735,7 @@ mod tests {
                 access_count: 0,
                 evaluation_score: 1.0,
                 embedding: vec![],
+                status: MemoryStatus::Active,
             })?;
             storage.insert_memory(&MemoryEntry {
                 id: format!("experience-{}", i),
@@ -547,6 +748,7 @@ mod tests {
                 access_count: 0,
                 evaluation_score: 1.0,
                 embedding: vec![],
+                status: MemoryStatus::Active,
             })?;
         }
 
@@ -563,20 +765,24 @@ mod tests {
                 access_count: 0,
                 evaluation_score: 1.0,
                 embedding: vec![],
+                status: MemoryStatus::Active,
             })?;
         }
 
         // 1. Verify Query Plan for Session Query (with session_id)
-        let query_with_session = 
-            "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score 
+        let query_with_session =
+            "SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score, status 
              FROM memories 
-             WHERE layer IN ('Rule', 'Persona', 'Experience')
+             WHERE layer IN ('Rule', 'Persona', 'Experience') AND status = 'Active'
              UNION ALL
-             SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score 
-             FROM memories 
-             WHERE layer = 'Session' AND session_id = ?1";
+             SELECT id, layer, session_id, content, tags, embedding, created_at, last_accessed, access_count, evaluation_score, status 
+             FROM memories INDEXED BY idx_memories_layer_session
+             WHERE layer = 'Session' AND session_id = ?1 AND status = 'Active'";
 
-        let mut stmt = storage.conn.prepare(&format!("EXPLAIN QUERY PLAN {}", query_with_session))?;
+        let mut stmt = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", query_with_session))?;
+
         let mut rows = stmt.query(params!["session-0"])?;
         let mut plan_details = Vec::new();
         while let Some(row) = rows.next()? {
@@ -592,14 +798,21 @@ mod tests {
 
         // Assert that SQLite uses idx_memories_layer_session and avoids SCAN TABLE memories
         let uses_index = plan_details.iter().any(|detail| {
-            detail.contains("USING INDEX idx_memories_layer_session") || detail.contains("USING COVERING INDEX idx_memories_layer_session")
+            detail.contains("USING INDEX idx_memories_layer_session")
+                || detail.contains("USING COVERING INDEX idx_memories_layer_session")
         });
         let has_full_scan = plan_details.iter().any(|detail| {
             detail.contains("SCAN TABLE memories") && !detail.contains("USING INDEX")
         });
 
-        assert!(uses_index, "Query plan should use idx_memories_layer_session index");
-        assert!(!has_full_scan, "Query plan should avoid full table scan of memories table");
+        assert!(
+            uses_index,
+            "Query plan should use idx_memories_layer_session index"
+        );
+        assert!(
+            !has_full_scan,
+            "Query plan should avoid full table scan of memories table"
+        );
 
         // 2. Verify Session Isolation
         let retrieved = storage.get_relevant_memories(Some("session-0"))?;
@@ -608,7 +821,12 @@ mod tests {
         assert_eq!(retrieved.len(), 400);
         for mem in &retrieved {
             if mem.layer == MemoryLayer::Session {
-                assert_eq!(mem.session_id.as_deref(), Some("session-0"), "Session isolation failed: got session ID {:?}", mem.session_id);
+                assert_eq!(
+                    mem.session_id.as_deref(),
+                    Some("session-0"),
+                    "Session isolation failed: got session ID {:?}",
+                    mem.session_id
+                );
             }
         }
 
@@ -616,7 +834,11 @@ mod tests {
         let retrieved_none = storage.get_relevant_memories(None)?;
         assert_eq!(retrieved_none.len(), 300);
         for mem in &retrieved_none {
-            assert_ne!(mem.layer, MemoryLayer::Session, "Session memory returned when session_id was None");
+            assert_ne!(
+                mem.layer,
+                MemoryLayer::Session,
+                "Session memory returned when session_id was None"
+            );
         }
 
         // 3. Performance Timing
@@ -627,7 +849,10 @@ mod tests {
             let _ = storage.get_relevant_memories(Some(&s_id))?;
         }
         let elapsed = start_time.elapsed();
-        println!("Performance check: {} queries took {:?}", iterations, elapsed);
+        println!(
+            "Performance check: {} queries took {:?}",
+            iterations, elapsed
+        );
 
         Ok(())
     }
