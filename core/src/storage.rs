@@ -62,13 +62,6 @@ impl SqliteStorage {
             )
             .context("Failed to create idx_memories_created_at")?;
 
-        self.conn
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (status);",
-                [],
-            )
-            .context("Failed to create idx_memories_status")?;
-
         // Dynamic migration for status column for existing DBs
         let has_status = self
             .conn
@@ -81,11 +74,14 @@ impl SqliteStorage {
                 "ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'Active';",
                 [],
             )?;
-            self.conn.execute(
+        }
+
+        self.conn
+            .execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (status);",
                 [],
-            )?;
-        }
+            )
+            .context("Failed to create idx_memories_status")?;
 
         // Create graph_associations with strict SQLite foreign keys targeting memories(id) with ON DELETE CASCADE
         self.conn
