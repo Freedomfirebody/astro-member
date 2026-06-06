@@ -41,7 +41,8 @@ impl JsonRpcError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryLayer {
-    Principle,
+    #[serde(alias = "Principle")]
+    Rule,
     Persona,
     Experience,
     Session,
@@ -50,7 +51,7 @@ pub enum MemoryLayer {
 impl MemoryLayer {
     pub fn base_weight(&self) -> f64 {
         match self {
-            MemoryLayer::Principle => 10.0,
+            MemoryLayer::Rule => 10.0,
             MemoryLayer::Persona => 5.0,
             MemoryLayer::Experience => 3.0,
             MemoryLayer::Session => 1.0,
@@ -59,7 +60,7 @@ impl MemoryLayer {
     
     pub fn decay_rate(&self) -> f64 {
         match self {
-            MemoryLayer::Principle => 0.0,
+            MemoryLayer::Rule => 0.0,
             MemoryLayer::Persona => 0.001,
             MemoryLayer::Experience => 0.05,
             MemoryLayer::Session => 0.2, // Fast decay
@@ -79,6 +80,16 @@ pub struct MemoryEntry {
     pub last_accessed: chrono::DateTime<chrono::Utc>,
     pub access_count: u32,
     pub evaluation_score: f64, // Used for Experience adaptation
+    #[serde(default)]
+    pub embedding: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Association {
+    pub source_id: String,
+    pub target_id: String,
+    pub relation_type: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize)]

@@ -1,8 +1,45 @@
-node_modules/
-build/
-dist/
-coverage/
+# Rust / Cargo
+/target
+Cargo.lock.bak
+**/*.rs.bk
+
+# Python cache / virtual envs
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Databases & local state
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.mcp_memory_storage/
+
+# Model cache & configuration
+.fastembed_cache/
+.env
+.env.local
+.env.*.local
+
+# IDEs and OS files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo
 .DS_Store
-*.log
-.env*
-!.env.example
+Thumbs.db
+
+# Agent teamwork temporary files
+.agents/
+temp_test_*/
+ORIGINAL_REQUEST.md
+teamwork_projects/
